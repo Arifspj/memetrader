@@ -1,13 +1,12 @@
 import 'dart:async';
 
 import 'package:flutter/foundation.dart';
-import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
 import '../core/api_client.dart';
 import '../core/ws_client.dart';
 import '../models/models.dart';
 import '../wallet/local_signer.dart';
-
+import 'token_store.dart';
 enum AuthStatus { signedOut, connecting, signedIn }
 
 /// Single source of truth for the UI.
@@ -15,15 +14,21 @@ enum AuthStatus { signedOut, connecting, signedIn }
 /// This class only *stores* and *forwards* backend data. Every decision
 /// (buy, sell, TP, SL, score) is made by the Python engine.
 class AppState extends ChangeNotifier {
-  AppState({ApiClient? api, WsClient? ws})
-    : api = api ?? ApiClient(),
-      _ws = ws ?? WsClient(api: api ?? ApiClient()) {
+  /// One ApiClient is shared with the WebSocket client on purpose: the socket
+  /// reads the JWT from it, so a second instance would silently send an
+  /// unauthenticated `/ws/stream?token=` and get a 403 handshake.
+  factory AppState({ApiClient? api, WsClient? ws, TokenStore? store}) {
+    final client = api ?? ApiClient();
+    return AppState._(client, ws ?? WsClient(api: client), store ?? const SecureTokenStore());
+  }
+
+  AppState._(this.api, this._ws, this._storage) {
     _ws.events.listen(_onWsEvent);
   }
 
   final ApiClient api;
   final WsClient _ws;
-  final _storage = const FlutterSecureStorage();
+  final TokenStore _storage;
 
   // --- auth ----------------------------------------------------------------
 
@@ -40,6 +45,11 @@ class AppState extends ChangeNotifier {
   // --- data ----------------------------------------------------------------
 
   Portfolio _portfolio = Portfolio.empty;
+
+  /// False until a real portfolio payload has been parsed. Screens use this to
+  /// print a placeholder instead of a `$0.00` that would read like a wiped
+  /// account when the truth is simply "the number could not be loaded".
+  bool _hasPortfolio = false;
   BotStatus? _botStatus;
   OpportunityList _opportunityList = OpportunityList.empty;
   List<Position> _positions = const [];
@@ -50,7 +60,14 @@ class AppState extends ChangeNotifier {
   Map<String, dynamic> _health = const {};
   String? _connectionError;
 
+  /// Last open-position count seen on the stream, used to decide when the
+  /// position/trade lists need refetching.
+  int? _lastStreamedOpenCount;
+
   Portfolio get portfolio => _portfolio;
+
+  /// Whether [portfolio] holds a value that actually came from the backend.
+  bool get hasPortfolio => _hasPortfolio;
   BotStatus? get botStatus => _botStatus;
   List<Opportunity> get opportunities => _opportunityList.items;
   int get tokensScanned => _opportunityList.scanned;
@@ -79,8 +96,8 @@ class AppState extends ChangeNotifier {
 
   Future<bool> restoreSession() async {
     try {
-      final token = await _storage.read(key: 'jwt');
-      final address = await _storage.read(key: 'wallet_address');
+      final token = await _storage.read('jwt');
+      final address = await _storage.read('wallet_address');
       if (token == null || address == null) return false;
       api.token = token;
       _walletAddress = address;
@@ -109,8 +126,8 @@ class AppState extends ChangeNotifier {
         message: challenge.message,
         signature: signature,
       );
-      await _storage.write(key: 'jwt', value: token);
-      await _storage.write(key: 'wallet_address', value: walletAddress);
+      await _storage.write('jwt', token);
+      await _storage.write('wallet_address', walletAddress);
       _walletAddress = walletAddress;
       _auth = AuthStatus.signedIn;
       _ws.connect();
@@ -145,8 +162,8 @@ class AppState extends ChangeNotifier {
   }
 
   Future<void> signOut() async {
-    await _storage.delete(key: 'jwt');
-    await _storage.delete(key: 'wallet_address');
+    await _storage.delete('jwt');
+    await _storage.delete('wallet_address');
     api.token = null;
     _walletAddress = null;
     _auth = AuthStatus.signedOut;
@@ -158,9 +175,15 @@ class AppState extends ChangeNotifier {
 
   Future<void> refreshAll() async {
     if (!isSignedIn) return;
-    _connectionError = null;
-    await Future.wait([
-      _load(() => api.portfolio(), (v) => _portfolio = v),
+    // Every loader runs concurrently, so a loader must not touch
+    // `_connectionError` itself: a fast successful call would otherwise wipe
+    // the error a slower failing call had just recorded. The cycle decides the
+    // message once all of them have reported.
+    final errors = await Future.wait([
+      _load(() => api.portfolio(), (v) {
+        _portfolio = v;
+        _hasPortfolio = true;
+      }),
       _load(() => api.botState(), (v) => _botStatus = v),
       _load(() => api.opportunities(limit: 20), (v) => _opportunityList = v),
       _load(() => api.allPositions(), (v) => _positions = v),
@@ -169,7 +192,64 @@ class AppState extends ChangeNotifier {
       _load(() => api.riskSettings(), (v) => _risk = v),
       _load(() => api.wallet(), (v) => _wallet = v),
     ]);
+    _connectionError = _pickError(errors);
     notifyListeners();
+  }
+
+  /// The single message to show for one refresh cycle. An expired session
+  /// outranks everything; otherwise the first real failure is reported.
+  String? _pickError(List<String?> errors) {
+    if (errors.isEmpty) return null;
+    for (final e in errors) {
+      if (e != null && e.startsWith('Session expired')) return e;
+    }
+    for (final e in errors) {
+      if (e != null) return e;
+    }
+    return null;
+  }
+
+  /// Trade list refetches are fire-and-forget and can overlap. This counter
+  /// identifies the newest one so a slow older response cannot overwrite it.
+  int _refreshTicket = 0;
+
+  /// The stream reports how many positions are open, not which ones, and no
+  /// trade list at all. When that count moves, the lists are refetched - so the
+  /// History and position rows stay truthful without polling on every frame.
+  void _refreshListsIfCountsChanged() {
+    final streamed = _botStatus?.openPositions;
+    if (streamed == null) return;
+    if (streamed == _lastStreamedOpenCount) return;
+    final first = _lastStreamedOpenCount == null;
+    _lastStreamedOpenCount = streamed;
+    if (first) return; // initial frame matches the REST snapshot just fetched
+    unawaited(_refreshTradeLists());
+  }
+
+  Future<void> _refreshTradeLists() async {
+    // The count can move again while a refetch is in flight, so several
+    // refetches run at once. They can complete out of order, and letting an
+    // older response land last would leave the screen showing a position count
+    // the backend no longer has. Only the newest refetch may apply its result.
+    final ticket = ++_refreshTicket;
+    try {
+      final results = await Future.wait([
+        api.allPositions(),
+        api.trades(limit: 100),
+      ]);
+      final portfolio = await api.portfolio();
+      if (ticket != _refreshTicket) return; // a newer refetch superseded this one
+      _positions = results[0] as List<Position>;
+      _trades = results[1] as List<Trade>;
+      _portfolio = portfolio;
+      _hasPortfolio = true;
+      notifyListeners();
+    } on ApiException {
+      // The stream keeps the counters correct; a failed list refresh is not
+      // worth surfacing on top of that.
+    } catch (_) {
+      // Same rationale as above.
+    }
   }
 
   Future<void> refreshHealth() async {
@@ -183,17 +263,22 @@ class AppState extends ChangeNotifier {
     notifyListeners();
   }
 
-  Future<void> _load<T>(Future<T> Function() fetch, void Function(T) apply) async {
+  /// Fetches one snapshot and applies it, returning the failure message for
+  /// the calling cycle instead of mutating shared state itself.
+  Future<String?> _load<T>(
+    Future<T> Function() fetch,
+    void Function(T) apply,
+  ) async {
     try {
       apply(await fetch());
+      return null;
     } on ApiException catch (e) {
-      if (e.isUnauthorized) {
-        _connectionError = 'Session expired. Sign in again.';
-        return;
-      }
-      _connectionError ??= e.message;
+      if (e.isUnauthorized) return 'Session expired. Sign in again.';
+      return e.message;
+    } on PayloadFormatException catch (e) {
+      return e.userMessage;
     } catch (e) {
-      _connectionError ??= e.toString();
+      return 'Unable to update trading data. Please retry. ($e)';
     }
   }
 
@@ -225,9 +310,15 @@ class AppState extends ChangeNotifier {
     switch (event['type']) {
       case 'state':
       case 'bot_state':
-        // The stream frame also carries the newest engine log lines.
-        _botStatus = BotStatus.fromJson(event);
+        // The stream frame carries the bot status, a partial portfolio and the
+        // newest engine log lines. Positions and trades are *lists*, and the
+        // stream only sends a count, so a changed count triggers a REST refresh
+        // of those lists.
+        _botStatus = (_botStatus ?? BotStatus.fromJson(event)).mergedWithStream(event);
+        _portfolio = _portfolio.mergedWithStream(event);
+        _opportunityList = _opportunityList.mergedWithStream(event);
         _mergeLatestLogs(event['latest']);
+        _refreshListsIfCountsChanged();
       case 'pnl_update':
         _portfolio = Portfolio.fromJson(event);
       case 'position_update':
@@ -329,7 +420,18 @@ class AppState extends ChangeNotifier {
   }
 
   /// One-shot log fetch used by pull-to-refresh.
-  Future<void> refreshLogs() => _load(() => api.logs(limit: 50), (v) => _logs = v);
+  Future<void> refreshLogs() async {
+    _connectionError = await _load(() => api.logs(limit: 50), (v) => _logs = v);
+    notifyListeners();
+  }
+
+  /// Exposed for wiring tests that assert the socket shares this token.
+  @visibleForTesting
+  WsClient get socket => _ws;
+
+  /// Exposed so tests can drive overlapping list refetches deterministically.
+  @visibleForTesting
+  void debugRefreshTradeLists() => unawaited(_refreshTradeLists());
 
   @override
   void dispose() {

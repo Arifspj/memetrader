@@ -30,12 +30,17 @@ class WalletScreen extends StatelessWidget {
       child: ListView(
         padding: const EdgeInsets.fromLTRB(16, 8, 16, 24),
         children: [
+          if (state.connectionError != null) ...[
+            ConnectionErrorBanner(message: state.connectionError!),
+            const SizedBox(height: 14),
+          ],
           _WalletHeader(state: state, portfolio: portfolio),
           const SizedBox(height: 18),
           _BalanceBlock(
             portfolio: portfolio,
             isLive: isLive,
             usdcBalance: state.wallet?.balanceUsdc,
+            hasPortfolio: state.hasPortfolio,
           ),
           const SizedBox(height: 16),
           Row(
@@ -162,11 +167,16 @@ class _BalanceBlock extends StatelessWidget {
     required this.portfolio,
     required this.isLive,
     required this.usdcBalance,
+    required this.hasPortfolio,
   });
 
   final Portfolio portfolio;
   final bool isLive;
   final double? usdcBalance;
+
+  /// False when no portfolio payload has ever loaded, so the balance prints a
+  /// placeholder rather than a `$0.00` that looks like a wiped account.
+  final bool hasPortfolio;
 
   @override
   Widget build(BuildContext context) {
@@ -180,28 +190,30 @@ class _BalanceBlock extends StatelessWidget {
         ),
         const SizedBox(height: 6),
         Text(
-          formatUsd(portfolio.availableUsd),
-          style: const TextStyle(
+          hasPortfolio ? formatUsd(portfolio.availableUsd) : '--',
+          style: TextStyle(
             fontSize: 38,
             fontWeight: FontWeight.w800,
             letterSpacing: -1,
-            fontFeatures: [FontFeature.tabularFigures()],
+            fontFeatures: const [FontFeature.tabularFigures()],
+            color: hasPortfolio ? null : AppTheme.textMuted,
           ),
         ),
         const SizedBox(height: 8),
-        Row(
-          children: [
-            Text(
-              formatPct(portfolio.allTimePnlPct),
-              style: TextStyle(color: pnlColor(portfolio.allTimePnlUsd), fontSize: 15, fontWeight: FontWeight.w700),
-            ),
-            const SizedBox(width: 12),
-            Text(
-              formatSignedUsd(portfolio.allTimePnlUsd),
-              style: TextStyle(color: pnlColor(portfolio.allTimePnlUsd), fontSize: 15, fontWeight: FontWeight.w600),
-            ),
-          ],
-        ),
+        if (hasPortfolio)
+          Row(
+            children: [
+              Text(
+                formatPct(portfolio.allTimePnlPct),
+                style: TextStyle(color: pnlColor(portfolio.allTimePnlUsd), fontSize: 15, fontWeight: FontWeight.w700),
+              ),
+              const SizedBox(width: 12),
+              Text(
+                formatSignedUsd(portfolio.allTimePnlUsd),
+                style: TextStyle(color: pnlColor(portfolio.allTimePnlUsd), fontSize: 15, fontWeight: FontWeight.w600),
+              ),
+            ],
+          ),
         if (usd != null) ...[
           const SizedBox(height: 18),
           SectionCard(
@@ -246,7 +258,11 @@ class _EngineCard extends StatelessWidget {
             const SizedBox(width: 8),
             const Text('AI trading engine v2.4', style: TextStyle(fontSize: 14, fontWeight: FontWeight.w700)),
             const Spacer(),
-            LivePill(isLive: isLive),
+            LivePill(
+              isLive: isLive,
+              label: isLive ? 'LIVE' : 'IDLE',
+              tone: isLive ? AppTheme.live : AppTheme.warning,
+            ),
           ],
         ),
         const SizedBox(height: 6),

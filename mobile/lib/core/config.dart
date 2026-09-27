@@ -24,9 +24,13 @@ class AppConfig {
   /// Phantom deep link used by the "Open Phantom" affordance.
   static const String phantomDeepLink = 'https://phantom.app';
 
-  /// A random throwaway devnet key can be generated from the login screen.
-  /// Never available in release builds.
-  static bool get allowDevWallet => kDebugMode;
+  /// Shows the "USE DEV WALLET" button, which signs in with a throwaway
+  /// devnet key. Opt-in per build so it can never ship by accident:
+  ///
+  ///   flutter build web --dart-define=ALLOW_DEV_WALLET=true
+  static const bool _allowDevWallet = bool.fromEnvironment('ALLOW_DEV_WALLET');
+
+  static bool get allowDevWallet => _allowDevWallet || kDebugMode;
 
   static const Duration requestTimeout = Duration(seconds: 15);
 }

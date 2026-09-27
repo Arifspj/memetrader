@@ -52,15 +52,22 @@ class SectionLabel extends StatelessWidget {
 }
 
 /// The green LIVE / red OFFLINE pill from the reference design.
+///
+/// [tone] exists because a stopped bot must not be painted like a broken
+/// connection: default maps [isLive] to live/offline colours, while callers
+/// that have three states (live / idle / offline) pass the middle one in.
 class LivePill extends StatelessWidget {
-  const LivePill({super.key, required this.isLive, this.label});
+  const LivePill({super.key, required this.isLive, this.label, this.tone});
 
   final bool isLive;
   final String? label;
 
+  /// Overrides the colour implied by [isLive].
+  final Color? tone;
+
   @override
   Widget build(BuildContext context) {
-    final color = isLive ? AppTheme.live : AppTheme.offline;
+    final color = tone ?? (isLive ? AppTheme.live : AppTheme.offline);
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 4),
       decoration: BoxDecoration(
@@ -177,6 +184,59 @@ class ScoreBar extends StatelessWidget {
       ),
     );
   }
+}
+
+/// Inline banner for a failed or unusable backend response.
+///
+/// The engine's numbers must never silently show as zero after a bad response,
+/// so the failure is stated in plain words on the screen the user is already
+/// looking at. It disappears as soon as a clean snapshot lands.
+class ConnectionErrorBanner extends StatelessWidget {
+  const ConnectionErrorBanner({super.key, required this.message});
+
+  final String message;
+
+  @override
+  Widget build(BuildContext context) => Container(
+    width: double.infinity,
+    padding: const EdgeInsets.all(12),
+    decoration: BoxDecoration(
+      color: AppTheme.offline.withValues(alpha: 0.10),
+      borderRadius: BorderRadius.circular(10),
+      border: Border.all(color: AppTheme.offline.withValues(alpha: 0.45)),
+    ),
+    child: Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const Icon(Icons.error_outline_rounded, size: 18, color: AppTheme.offline),
+        const SizedBox(width: 10),
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                'Unable to update trading data',
+                style: TextStyle(
+                  color: AppTheme.offline,
+                  fontSize: 12,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+              const SizedBox(height: 2),
+              Text(
+                message,
+                style: const TextStyle(
+                  color: AppTheme.textSecondary,
+                  fontSize: 11,
+                  height: 1.4,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ],
+    ),
+  );
 }
 
 class EmptyState extends StatelessWidget {

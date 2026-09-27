@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
 import '../core/theme.dart';
+import '../core/ws_client.dart';
 import '../state/app_state.dart';
 import '../widgets/common.dart';
 import 'ai_screen.dart';
@@ -78,9 +79,32 @@ class _AppShellState extends State<AppShell> {
       actions: [
         Padding(
           padding: const EdgeInsets.only(right: 12),
-          child: Center(child: LivePill(isLive: state.isLive)),
+          child: Center(child: _ConnectionPill(state: state)),
         ),
       ],
+    );
+  }
+}
+
+/// Header badge.
+///
+/// A stopped bot is not "offline" - red OFFLINE must mean the connection is
+/// actually gone, otherwise a healthy idle session looks like a failure.
+class _ConnectionPill extends StatelessWidget {
+  const _ConnectionPill({required this.state});
+
+  final AppState state;
+
+  @override
+  Widget build(BuildContext context) {
+    final connected = state.wsConnection.value == WsStatus.connected;
+    if (!connected) {
+      return const LivePill(isLive: false, label: 'OFFLINE');
+    }
+    return LivePill(
+      isLive: state.isLive,
+      label: state.isLive ? 'LIVE' : 'IDLE',
+      tone: state.isLive ? AppTheme.live : AppTheme.warning,
     );
   }
 }

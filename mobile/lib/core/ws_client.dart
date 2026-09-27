@@ -2,10 +2,12 @@ import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter/foundation.dart';
-import 'package:web_socket_channel/web_socket_channel.dart';
+
+import 'package:web_socket_channel/web_socket_channel.dart' show WebSocketChannel;
 
 import 'api_client.dart';
 import 'config.dart';
+import 'ws_connector.dart';
 
 /// Realtime feed from the backend. Flutter never polls: every number on screen
 /// arrives from a REST snapshot or from one of these events.
@@ -36,11 +38,16 @@ class WsClient {
     _connection.value = WsStatus.connecting;
 
     final base = AppConfig.wsBaseUrl;
-    final query = api.token == null
-        ? ''
-        : '?token=${Uri.encodeComponent(api.token!)}';
+    final token = api.token;
+    if (token == null) {
+      // Never open an unauthenticated socket: the backend answers 403 and the
+      // reconnect loop would spin forever.
+      _scheduleReconnect();
+      return;
+    }
+    final query = '?token=${Uri.encodeComponent(token)}';
     try {
-      final channel = WebSocketChannel.connect(Uri.parse('$base/ws/stream$query'));
+      final channel = connectSocket(Uri.parse('$base/ws/stream$query'));
       _channel = channel;
       _sub = channel.stream.listen(
         _onMessage,
@@ -74,6 +81,10 @@ class WsClient {
     _attempt++;
     _reconnect = Timer(Duration(seconds: seconds), connect);
   }
+
+  /// Exposed for tests that assert malformed frames never reach the UI.
+  @visibleForTesting
+  void handleFrameForTest(dynamic raw) => _onMessage(raw);
 
   void _teardown() {
     _sub?.cancel();
