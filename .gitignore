@@ -28,7 +28,8 @@ mobile/.flutter-plugins
 mobile/.flutter-plugins-dependencies
 mobile/build/
 mobile/.packages
-mobile/pubspec.lock
+# pubspec.lock IS committed: this is an application, so reproducible builds
+# depend on a pinned dependency set.
 
 # ide
 .idea/
